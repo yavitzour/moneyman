@@ -1,3 +1,4 @@
+# MoneyMan build workflow
 name: Create and publish a Docker image
 
 on:
