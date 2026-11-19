@@ -1,5 +1,7 @@
-# Based on daniel-hauser/moneyman .github/workflows/scrape.yml
-# One config secret, but two independent Docker/browser sessions for Cal.
+# MoneyMan: supports 0, 1 or 2 Visa Cal credentials.
+# With 2, the second account runs in a separate GitHub runner/browser.
+# With 1, the first job runs normally and the second job is skipped.
+# Other providers run once. Config is read from the existing MONEYMAN_CONFIG secret.
 name: Scrape
 
 on:
@@ -21,23 +23,54 @@ on:
   schedule:
     - cron: "5 10,22 * * *"
 
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: household-finances-scrape
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
 
 jobs:
-  scrape:
+  main-and-first-cal:
+    name: Other accounts and Cal account 1 (if present)
     runs-on: ubuntu-latest
+    outputs:
+      has_second_cal: ${{ steps.check-cal-count.outputs.has_second_cal }}
     steps:
+      - id: check-cal-count
+        name: Check Cal account count
+        shell: bash
+        env:
+          MONEYMAN_CONFIG: ${{ secrets.MONEYMAN_CONFIG }}
+        run: |
+          set -euo pipefail
+          if ! jq -e '.accounts | type == "array"' <<< "$MONEYMAN_CONFIG" >/dev/null; then
+            echo "::error::MONEYMAN_CONFIG must be valid JSON with an accounts array."
+            exit 1
+          fi
+          count=$(jq -r '[.accounts[] | select(.companyId == "visaCal")] | length' <<< "$MONEYMAN_CONFIG")
+          if (( count > 2 )); then
+            echo "::error::This workflow supports up to two Cal accounts. Found $count."
+            exit 1
+          fi
+          echo "Found $count Cal account(s)."
+          if (( count == 2 )); then
+            echo "has_second_cal=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_second_cal=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - id: normalize-repository-name
-        run: echo "repository=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-
+        shell: bash
+        run: echo "repository=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
       - id: set-container-image
+        shell: bash
         run: echo "image=${{ env.REGISTRY }}/${{ steps.normalize-repository-name.outputs.repository }}:${{ github.event.inputs.containerTag || 'latest' }}" >> "$GITHUB_OUTPUT"
-
-      - name: Pull container image
-        run: docker pull "${{ steps.set-container-image.outputs.image }}"
-
-      - name: Scrape with independent Cal sessions
+      - name: Scrape other accounts and first Cal account
         shell: bash
         env:
           MONEYMAN_CONFIG: ${{ secrets.MONEYMAN_CONFIG }}
@@ -47,46 +80,52 @@ jobs:
           IMAGE: ${{ steps.set-container-image.outputs.image }}
         run: |
           set -euo pipefail
-          # Never print configs: they contain bank credentials and storage tokens.
-          # This implementation expects the secret to contain valid JSON.
-          count=$(jq -r '[.accounts[] | select(.companyId == "visaCal")] | length' <<< "$MONEYMAN_CONFIG")
-          if [[ "$count" != "2" ]]; then
-            echo "Expected exactly two visaCal logins, found $count; stopping to avoid skipping accounts."
+          # Keep all non-Cal accounts plus, at most, the first Cal account.
+          # With only one Cal account, this leaves that account in the run.
+          filtered=$(jq -c '.accounts |= ([.[] | select(.companyId != "visaCal")] + ([.[] | select(.companyId == "visaCal")][0:1]))' <<< "$MONEYMAN_CONFIG")
+          count=$(jq -r '.accounts | length' <<< "$filtered")
+          if (( count == 0 )); then
+            echo "No accounts to scrape in the first job."
+            exit 0
+          fi
+          echo "Scraping $count account(s) in first isolated container."
+          docker pull "$IMAGE"
+          MONEYMAN_CONFIG="$filtered" docker run --rm \
+            -e MONEYMAN_CONFIG -e DEBUG -e TZ -e SEND_NEW_CONFIG_TO_TG \
+            "$IMAGE"
+
+  second-cal:
+    name: Cal account 2 (only when configured)
+    runs-on: ubuntu-latest
+    needs: main-and-first-cal
+    # The second Cal account gets a fresh runner even if the first scrape fails.
+    # When the config has 0 or 1 Cal accounts, skip this job completely.
+    if: ${{ always() && !cancelled() && needs.main-and-first-cal.outputs.has_second_cal == 'true' }}
+    steps:
+      - id: normalize-repository-name
+        shell: bash
+        run: echo "repository=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      - id: set-container-image
+        shell: bash
+        run: echo "image=${{ env.REGISTRY }}/${{ steps.normalize-repository-name.outputs.repository }}:${{ github.event.inputs.containerTag || 'latest' }}" >> "$GITHUB_OUTPUT"
+      - name: Scrape second Cal account on a fresh runner
+        shell: bash
+        env:
+          MONEYMAN_CONFIG: ${{ secrets.MONEYMAN_CONFIG }}
+          DEBUG: ${{ github.event.inputs.DEBUG || '' }}
+          TZ: Asia/Jerusalem
+          SEND_NEW_CONFIG_TO_TG: ${{ github.event.inputs.sendNewConfigToTg }}
+          IMAGE: ${{ steps.set-container-image.outputs.image }}
+        run: |
+          set -euo pipefail
+          filtered=$(jq -c '.accounts |= ([.[] | select(.companyId == "visaCal")][1:2])' <<< "$MONEYMAN_CONFIG")
+          count=$(jq -r '.accounts | length' <<< "$filtered")
+          if (( count != 1 )); then
+            echo "::error::Expected one second Cal account; found $count. Check MONEYMAN_CONFIG."
             exit 1
           fi
-
-          # Session 1: all other providers + the first Cal login.
-          config_first=$(jq -c '
-            .accounts |= (
-              [ .[] | select(.companyId != "visaCal") ] +
-              ([ .[] | select(.companyId == "visaCal") ][0:1])
-            )
-          ' <<< "$MONEYMAN_CONFIG")
-
-          # Session 2: the second Cal login only.
-          config_second=$(jq -c '
-            .accounts |= ([ .[] | select(.companyId == "visaCal") ][1:2])
-          ' <<< "$MONEYMAN_CONFIG")
-
-          failed=0
-          echo "Starting first independent scraper container (other accounts + first Cal login)."
-          if MONEYMAN_CONFIG="$config_first" docker run --rm \
+          echo "Scraping second Cal account in fresh runner."
+          docker pull "$IMAGE"
+          MONEYMAN_CONFIG="$filtered" docker run --rm \
             -e MONEYMAN_CONFIG -e DEBUG -e TZ -e SEND_NEW_CONFIG_TO_TG \
-            "$IMAGE"; then
-            echo "First container completed."
-          else
-            echo "First container exited with an error; second container will still run."
-            failed=1
-          fi
-
-          echo "Starting second independent scraper container (second Cal login)."
-          if MONEYMAN_CONFIG="$config_second" docker run --rm \
-            -e MONEYMAN_CONFIG -e DEBUG -e TZ -e SEND_NEW_CONFIG_TO_TG \
-            "$IMAGE"; then
-            echo "Second container completed."
-          else
-            echo "Second container exited with an error."
-            failed=1
-          fi
-
-          exit "$failed"
+            "$IMAGE"
